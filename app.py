@@ -1,0 +1,306 @@
+"""
+Strava Activity Merger — Webhook Server
+When a Garmin strength activity lands on Strava, fetches the matching workout
+from Hevy's API and applies its title + exercise description.
+"""
+
+import os
+import time
+import logging
+import httpx
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+import json
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("strava-merger")
+
+# ── Config ──────────────────────────────────────────────────────────────────
+STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
+STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "merger-verify-token")
+HEVY_API_KEY = os.getenv("HEVY_API_KEY")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+TOKEN_FILE = os.getenv("TOKEN_FILE", "tokens.json")
+
+OVERLAP_WINDOW = 60 * 90  # 90 minutes (Hevy timestamps can be offset)
+
+STRAVA_API = "https://www.strava.com/api/v3"
+HEVY_API = "https://api.hevyapp.com/v1"
+
+# ── Token Management ───────────────────────────────────────────────────────
+
+def load_tokens() -> dict:
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_tokens(tokens: dict):
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+def get_access_token() -> str:
+    tokens = load_tokens()
+    if not tokens:
+        raise RuntimeError("No tokens found. Run /auth/start first.")
+
+    if tokens.get("expires_at", 0) < time.time() + 60:
+        log.info("Refreshing expired access token…")
+        resp = httpx.post("https://www.strava.com/oauth/token", data={
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        })
+        resp.raise_for_status()
+        new = resp.json()
+        tokens.update({
+            "access_token": new["access_token"],
+            "refresh_token": new["refresh_token"],
+            "expires_at": new["expires_at"],
+        })
+        save_tokens(tokens)
+
+    return tokens["access_token"]
+
+def strava_headers() -> dict:
+    return {"Authorization": f"Bearer {get_access_token()}"}
+
+# ── Strava API Helpers ─────────────────────────────────────────────────────
+
+def fetch_recent_activities(per_page: int = 10) -> list[dict]:
+    resp = httpx.get(f"{STRAVA_API}/activities", headers=strava_headers(),
+                     params={"per_page": per_page})
+    resp.raise_for_status()
+    return resp.json()
+
+def get_activity(activity_id: int) -> dict:
+    resp = httpx.get(f"{STRAVA_API}/activities/{activity_id}", headers=strava_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+def update_activity(activity_id: int, **fields) -> dict:
+    resp = httpx.put(f"{STRAVA_API}/activities/{activity_id}",
+                     headers=strava_headers(), json=fields)
+    resp.raise_for_status()
+    return resp.json()
+
+# ── Hevy API Helpers ───────────────────────────────────────────────────────
+
+def hevy_headers() -> dict:
+    return {"api-key": HEVY_API_KEY}
+
+def fetch_hevy_workouts(page: int = 1, page_size: int = 5) -> list[dict]:
+    resp = httpx.get(f"{HEVY_API}/workouts",
+                     headers=hevy_headers(),
+                     params={"page": page, "pageSize": page_size})
+    resp.raise_for_status()
+    return resp.json().get("workouts", [])
+
+def format_hevy_description(workout: dict) -> str:
+    lines = []
+    for exercise in workout.get("exercises", []):
+        title = exercise.get("title", "Unknown")
+        sets = exercise.get("sets", [])
+        set_lines = []
+        for s in sets:
+            weight = s.get("weight_kg")
+            reps = s.get("reps")
+            set_type = s.get("type", "normal")
+            prefix = ""
+            if set_type == "warmup":
+                prefix = "(W) "
+            elif set_type == "dropset":
+                prefix = "(D) "
+            elif set_type == "failure":
+                prefix = "(F) "
+
+            if weight is not None and reps is not None:
+                set_lines.append(f"{prefix}{weight}kg × {reps}")
+            elif reps is not None:
+                set_lines.append(f"{prefix}{reps} reps")
+            elif weight is not None:
+                set_lines.append(f"{prefix}{weight}kg")
+
+        lines.append(f"{title}")
+        for sl in set_lines:
+            lines.append(f"  {sl}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+# ── Merge Logic ────────────────────────────────────────────────────────────
+
+def is_garmin_strength(activity: dict) -> bool:
+    strength_types = {"WeightTraining", "Workout", "Crossfit"}
+    if activity.get("type") not in strength_types and activity.get("sport_type") not in strength_types:
+        return False
+    ext_id = activity.get("external_id", "") or ""
+    device = activity.get("device_name", "") or ""
+    return "garmin" in ext_id.lower() or "garmin" in device.lower()
+
+def find_and_merge():
+    """Scan recent Garmin strength activities and apply matching Hevy workout data."""
+    activities = fetch_recent_activities(per_page=10)
+    garmin_strength = [a for a in activities if is_garmin_strength(a)]
+
+    if not garmin_strength:
+        log.info("No Garmin strength activities found.")
+        return {"merged": 0}
+
+    hevy_workouts = fetch_hevy_workouts(page=1, page_size=10)
+    if not hevy_workouts:
+        log.info("No Hevy workouts found.")
+        return {"merged": 0}
+
+    from datetime import datetime
+
+    merged_count = 0
+    for garmin in garmin_strength:
+        garmin_start = datetime.fromisoformat(garmin["start_date"].replace("Z", "+00:00"))
+
+        for workout in hevy_workouts:
+            hevy_start = datetime.fromisoformat(workout["start_time"].replace("Z", "+00:00"))
+            diff = abs((garmin_start - hevy_start).total_seconds())
+
+            if diff > OVERLAP_WINDOW:
+                continue
+
+            # Check if already merged (title already matches Hevy's)
+            if garmin.get("name") == workout.get("title"):
+                continue
+
+            hevy_title = workout.get("title", "")
+            hevy_desc = format_hevy_description(workout)
+
+            log.info(f"Merging: Garmin #{garmin['id']} ← Hevy workout '{hevy_title}'")
+            update_activity(garmin["id"], name=hevy_title, description=hevy_desc)
+            merged_count += 1
+            log.info(f"✓ Applied Hevy title + description to Garmin #{garmin['id']}")
+            break
+
+    if merged_count == 0:
+        log.info("No matching Garmin+Hevy pairs found.")
+
+    return {"merged": merged_count}
+
+# ── FastAPI App ────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Strava Merger started.")
+    yield
+
+app = FastAPI(title="Strava Activity Merger", lifespan=lifespan)
+
+# ── OAuth Flow ─────────────────────────────────────────────────────────────
+
+@app.get("/auth/start")
+def auth_start():
+    url = (
+        f"https://www.strava.com/oauth/authorize"
+        f"?client_id={STRAVA_CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={BASE_URL}/auth/callback"
+        f"&scope=activity:read_all,activity:write"
+        f"&approval_prompt=auto"
+    )
+    return {"message": "Open this URL in your browser", "url": url}
+
+@app.get("/auth/callback")
+def auth_callback(code: str = Query(...)):
+    resp = httpx.post("https://www.strava.com/oauth/token", data={
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+    })
+    resp.raise_for_status()
+    data = resp.json()
+    save_tokens({
+        "access_token": data["access_token"],
+        "refresh_token": data["refresh_token"],
+        "expires_at": data["expires_at"],
+    })
+    return {"message": "Authenticated! Tokens saved. You can close this window."}
+
+# ── Strava Webhook ────────────────────────────────────────────────────────
+
+@app.get("/webhook")
+def webhook_verify(
+    mode: str = Query(None, alias="hub.mode"),
+    token: str = Query(None, alias="hub.verify_token"),
+    challenge: str = Query(None, alias="hub.challenge"),
+):
+    if mode == "subscribe" and token == STRAVA_VERIFY_TOKEN:
+        log.info("Webhook subscription verified.")
+        return JSONResponse({"hub.challenge": challenge})
+    return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+@app.post("/webhook")
+async def webhook_event(request: Request):
+    body = await request.json()
+    log.info(f"Webhook event received: {body}")
+
+    obj_type = body.get("object_type")
+    aspect_type = body.get("aspect_type")
+
+    if obj_type == "activity" and aspect_type == "create":
+        import asyncio
+        await asyncio.sleep(30)
+        try:
+            find_and_merge()
+        except Exception as e:
+            log.error(f"Merge failed: {e}")
+
+    return JSONResponse({"status": "ok"})
+
+# ── Manual Trigger ─────────────────────────────────────────────────────────
+
+@app.get("/merge")
+def manual_merge():
+    try:
+        result = find_and_merge()
+        return result
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ── Debug ─────────────────────────────────────────────────────────────────
+
+@app.get("/debug")
+def debug_activities():
+    activities = fetch_recent_activities(per_page=10)
+    hevy_workouts = fetch_hevy_workouts(page=1, page_size=5)
+    return {
+        "strava_activities": [
+            {
+                "id": a["id"],
+                "name": a.get("name"),
+                "type": a.get("type"),
+                "start_date": a.get("start_date"),
+                "device_name": a.get("device_name"),
+                "is_garmin_strength": is_garmin_strength(a),
+            }
+            for a in activities
+        ],
+        "hevy_workouts": [
+            {
+                "id": w.get("id"),
+                "title": w.get("title"),
+                "start_time": w.get("start_time"),
+                "exercises": len(w.get("exercises", [])),
+            }
+            for w in hevy_workouts
+        ],
+    }
+
+# ── Health ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def health():
+    return {"status": "running", "service": "strava-merger"}
