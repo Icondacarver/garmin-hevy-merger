@@ -6,6 +6,7 @@ from Hevy's API and applies its title + exercise description.
 
 import os
 import time
+import asyncio
 import logging
 import httpx
 from fastapi import FastAPI, Request, Query
@@ -161,33 +162,60 @@ def find_and_merge():
     from datetime import datetime
 
     merged_count = 0
+    used_workout_ids = set()
     for garmin in garmin_strength:
         garmin_start = datetime.fromisoformat(garmin["start_date"].replace("Z", "+00:00"))
 
+        # Pick the CLOSEST Hevy workout inside the window, not the first one found.
+        best, best_diff = None, None
         for workout in hevy_workouts:
+            if workout.get("id") in used_workout_ids:
+                continue
+
             hevy_start = datetime.fromisoformat(workout["start_time"].replace("Z", "+00:00"))
             diff = abs((garmin_start - hevy_start).total_seconds())
 
             if diff > OVERLAP_WINDOW:
                 continue
 
-            # Check if already merged (title already matches Hevy's)
-            if garmin.get("name") == workout.get("title"):
-                continue
+            if best_diff is None or diff < best_diff:
+                best, best_diff = workout, diff
 
-            hevy_title = workout.get("title", "")
-            hevy_desc = format_hevy_description(workout)
+        if best is None:
+            continue
 
-            log.info(f"Merging: Garmin #{garmin['id']} ← Hevy workout '{hevy_title}'")
-            update_activity(garmin["id"], name=hevy_title, description=hevy_desc)
-            merged_count += 1
-            log.info(f"✓ Applied Hevy title + description to Garmin #{garmin['id']}")
-            break
+        used_workout_ids.add(best.get("id"))
+
+        # Check if already merged (title already matches Hevy's)
+        if garmin.get("name") == best.get("title"):
+            continue
+
+        hevy_title = best.get("title", "")
+        hevy_desc = format_hevy_description(best)
+
+        log.info(f"Merging: Garmin #{garmin['id']} ← Hevy workout '{hevy_title}' ({int(best_diff // 60)} min apart)")
+        update_activity(garmin["id"], name=hevy_title, description=hevy_desc)
+        merged_count += 1
+        log.info(f"✓ Applied Hevy title + description to Garmin #{garmin['id']}")
 
     if merged_count == 0:
         log.info("No matching Garmin+Hevy pairs found.")
 
     return {"merged": merged_count}
+
+# ── Background Merge ───────────────────────────────────────────────────
+
+MERGE_DELAY = int(os.getenv("MERGE_DELAY", "30"))
+
+
+async def _delayed_merge(delay: int = None):
+    """Wait for Strava to settle, then run the merge off the request path."""
+    await asyncio.sleep(MERGE_DELAY if delay is None else delay)
+    try:
+        await asyncio.to_thread(find_and_merge)
+    except Exception as e:
+        log.error(f"Merge failed: {e}")
+
 
 # ── FastAPI App ────────────────────────────────────────────────────────────
 
@@ -251,12 +279,9 @@ async def webhook_event(request: Request):
     aspect_type = body.get("aspect_type")
 
     if obj_type == "activity" and aspect_type == "create":
-        import asyncio
-        await asyncio.sleep(30)
-        try:
-            find_and_merge()
-        except Exception as e:
-            log.error(f"Merge failed: {e}")
+        # Answer Strava immediately (it retries if we take too long), then merge
+        # in the background once Strava has finished ingesting the activity.
+        asyncio.create_task(_delayed_merge())
 
     return JSONResponse({"status": "ok"})
 
