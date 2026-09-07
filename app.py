@@ -27,6 +27,8 @@ STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "merger-verify-token")
 HEVY_API_KEY = os.getenv("HEVY_API_KEY")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 TOKEN_FILE = os.getenv("TOKEN_FILE", "tokens.json")
+# Shared secret for /merge and /debug. Unset = open (fine for localhost only).
+MERGE_TOKEN = os.getenv("MERGE_TOKEN")
 
 OVERLAP_WINDOW = 60 * 90  # 90 minutes (Hevy timestamps can be offset)
 
@@ -34,14 +36,73 @@ STRAVA_API = "https://www.strava.com/api/v3"
 HEVY_API = "https://api.hevyapp.com/v1"
 
 # ── Token Management ───────────────────────────────────────────────────────
+# Serverless hosts (Vercel) have a read-only, ephemeral filesystem, so when
+# DATABASE_URL is set the OAuth tokens live in Postgres instead of a JSON file.
+# Without it, behaviour is unchanged: a local tokens.json.
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def _db_conn():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _ensure_token_table():
+    with _db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strava_tokens (
+                    id INTEGER PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT NOT NULL,
+                    expires_at BIGINT NOT NULL
+                )
+                """
+            )
+        conn.commit()
+
 
 def load_tokens() -> dict:
+    if DATABASE_URL:
+        _ensure_token_table()
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT access_token, refresh_token, expires_at "
+                    "FROM strava_tokens WHERE id = 1"
+                )
+                row = cur.fetchone()
+        if not row:
+            return {}
+        return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
+
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE) as f:
             return json.load(f)
     return {}
 
+
 def save_tokens(tokens: dict):
+    if DATABASE_URL:
+        _ensure_token_table()
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO strava_tokens (id, access_token, refresh_token, expires_at)
+                    VALUES (1, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        expires_at = EXCLUDED.expires_at
+                    """,
+                    (tokens["access_token"], tokens["refresh_token"], int(tokens["expires_at"])),
+                )
+            conn.commit()
+        return
+
     with open(TOKEN_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
 
@@ -288,7 +349,9 @@ async def webhook_event(request: Request):
 # ── Manual Trigger ─────────────────────────────────────────────────────────
 
 @app.get("/merge")
-def manual_merge():
+def manual_merge(key: str = Query(None)):
+    if MERGE_TOKEN and key != MERGE_TOKEN:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     try:
         result = find_and_merge()
         return result
@@ -298,7 +361,9 @@ def manual_merge():
 # ── Debug ─────────────────────────────────────────────────────────────────
 
 @app.get("/debug")
-def debug_activities():
+def debug_activities(key: str = Query(None)):
+    if MERGE_TOKEN and key != MERGE_TOKEN:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     activities = fetch_recent_activities(per_page=10)
     hevy_workouts = fetch_hevy_workouts(page=1, page_size=5)
     return {
