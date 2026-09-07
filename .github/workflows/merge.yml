@@ -1,0 +1,27 @@
+name: Merge Hevy workouts into Strava
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+  workflow_dispatch:          # lets you run it by hand from the Actions tab
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger merge
+        env:
+          MERGER_URL: ${{ secrets.MERGER_URL }}
+          MERGE_TOKEN: ${{ secrets.MERGE_TOKEN }}
+        run: |
+          if [ -z "$MERGER_URL" ]; then
+            echo "MERGER_URL secret is not set" >&2
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
+            --max-time 60 \
+            "$MERGER_URL/merge?key=$MERGE_TOKEN")
+          echo "HTTP $code"
+          cat /tmp/out.json
+          echo
+          [ "$code" = "200" ]
