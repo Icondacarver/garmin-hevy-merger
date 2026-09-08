@@ -264,18 +264,50 @@ def find_and_merge():
 
     return {"merged": merged_count}
 
-# ── Background Merge ───────────────────────────────────────────────────
+# ── Single-Activity Merge (webhook path) ───────────────────────────────
 
-MERGE_DELAY = int(os.getenv("MERGE_DELAY", "30"))
+def merge_one(activity_id: int) -> dict:
+    """Merge one Strava activity by id. Used by the webhook, which knows
+    exactly which activity just landed, so there is no need to scan."""
+    from datetime import datetime
 
+    activity = get_activity(activity_id)
 
-async def _delayed_merge(delay: int = None):
-    """Wait for Strava to settle, then run the merge off the request path."""
-    await asyncio.sleep(MERGE_DELAY if delay is None else delay)
-    try:
-        await asyncio.to_thread(find_and_merge)
-    except Exception as e:
-        log.error(f"Merge failed: {e}")
+    if not is_garmin_strength(activity):
+        log.info(f"#{activity_id} is not a Garmin strength activity; skipping.")
+        return {"merged": 0, "reason": "not a garmin strength activity"}
+
+    hevy_workouts = fetch_hevy_workouts(page=1, page_size=10)
+    if not hevy_workouts:
+        log.info("No Hevy workouts found.")
+        return {"merged": 0, "reason": "no hevy workouts"}
+
+    start = datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00"))
+
+    best, best_diff = None, None
+    for workout in hevy_workouts:
+        hevy_start = datetime.fromisoformat(workout["start_time"].replace("Z", "+00:00"))
+        diff = abs((start - hevy_start).total_seconds())
+
+        if diff > OVERLAP_WINDOW:
+            continue
+
+        if best_diff is None or diff < best_diff:
+            best, best_diff = workout, diff
+
+    if best is None:
+        log.info(f"No Hevy workout within the window for #{activity_id}.")
+        return {"merged": 0, "reason": "no hevy workout in window"}
+
+    if activity.get("name") == best.get("title"):
+        log.info(f"#{activity_id} already merged.")
+        return {"merged": 0, "reason": "already merged"}
+
+    hevy_title = best.get("title", "")
+    log.info(f"Merging: Garmin #{activity_id} ← Hevy workout '{hevy_title}' ({int(best_diff // 60)} min apart)")
+    update_activity(activity_id, name=hevy_title, description=format_hevy_description(best))
+    log.info(f"✓ Applied Hevy title + description to Garmin #{activity_id}")
+    return {"merged": 1, "title": hevy_title}
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────
@@ -338,12 +370,19 @@ async def webhook_event(request: Request):
 
     obj_type = body.get("object_type")
     aspect_type = body.get("aspect_type")
+    object_id = body.get("object_id")
 
-    if obj_type == "activity" and aspect_type == "create":
-        # Answer Strava immediately (it retries if we take too long), then merge
-        # in the background once Strava has finished ingesting the activity.
-        asyncio.create_task(_delayed_merge())
+    if obj_type == "activity" and aspect_type == "create" and object_id:
+        # On serverless nothing survives the response, so the merge runs inline.
+        # It touches one activity, so it is quick; if Strava times out and
+        # retries, merging again is a no-op.
+        try:
+            result = await asyncio.to_thread(merge_one, int(object_id))
+            log.info(f"Webhook merge result: {result}")
+        except Exception as e:
+            log.error(f"Merge failed for #{object_id}: {e}")
 
+    # Always 200 — Strava disables subscriptions that keep erroring.
     return JSONResponse({"status": "ok"})
 
 # ── Manual Trigger ─────────────────────────────────────────────────────────
